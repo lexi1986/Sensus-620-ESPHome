@@ -1,0 +1,186 @@
+substitutions:
+  name: watermeter-c3
+  friendly_name: "Watermeter C3"
+  pulse_pin: GPIO4
+  liters_per_pulse: "1.0"
+
+esphome:
+  name: watermeter
+  friendly_name: Watermeter
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Watermeter Fallback Hotspot"
+    password: "123456789"
+
+captive_portal:
+
+# -----------------------------
+# Persistent total + flow window
+# -----------------------------
+globals:
+  - id: total_liters
+    type: float
+    restore_value: true
+    initial_value: "0"
+
+  - id: pulses_in_window
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: flow_l_min
+    type: float
+    restore_value: false
+    initial_value: "0"
+
+  - id: daily_start_l
+    type: float
+    restore_value: true
+    initial_value: "0"
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Amsterdam
+    on_time:
+      # Everyday at 00:00 start with 0 liters
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - lambda: |-
+              id(daily_start_l) = id(total_liters);
+
+# Manual meter reading (m³) for first time usage in HA
+number:
+  - platform: template
+    name: "Watermeter startstand (m³)"
+    id: water_start_m3
+    optimistic: true
+    restore_value: true
+    initial_value: 0
+    min_value: 0
+    max_value: 999999
+    step: 0.001
+    mode: box
+    entity_category: config
+    icon: mdi:counter
+
+# -----------------------------
+# Pulse input (debounced)
+# -----------------------------
+binary_sensor:
+  - platform: gpio
+    id: water_pulse
+    pin:
+      number: ${pulse_pin}
+      mode:
+        input: true
+        pullup: true     
+      inverted: true     
+    filters:
+      - delayed_on: 30ms   
+      - delayed_off: 30ms
+    on_press:
+      then:
+        - lambda: |-
+            id(pulses_in_window) += 1;
+            id(total_liters) += atof("${liters_per_pulse}");
+
+# -----------------------------
+# Sensors
+# -----------------------------
+sensor:
+  - platform: template
+    name: "Water flow"
+    id: water_flow_l_min
+    unit_of_measurement: "L/min"
+    icon: mdi:water
+    accuracy_decimals: 2
+    update_interval: 5s
+    lambda: |-
+      return id(flow_l_min);
+
+  - platform: template
+    name: "Water totaal (L)"
+    id: water_total_l
+    unit_of_measurement: "L"
+    icon: mdi:water
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: 5s
+    lambda: |-
+      return id(total_liters);
+
+  - platform: template
+    name: "Water totaal (m³)"
+    id: water_total_m3
+    unit_of_measurement: "m³"
+    device_class: water
+    state_class: total_increasing
+    accuracy_decimals: 3
+    update_interval: 5s
+    lambda: |-
+      return id(total_liters) / 1000.0;
+
+  - platform: template
+    name: "Water meterstand (m³)"
+    id: water_meterstand_m3
+    unit_of_measurement: "m³"
+    device_class: water
+    state_class: total_increasing
+    accuracy_decimals: 3
+    update_interval: 5s
+    lambda: |-
+      return id(water_start_m3).state + (id(total_liters) / 1000.0);
+
+  - platform: template
+    name: "Water verbruik vandaag (L)"
+    id: water_today_l
+    unit_of_measurement: "L"
+    device_class: water
+    state_class: total
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      float cur = id(total_liters);
+      float start = id(daily_start_l);
+      if (isnan(cur) || isnan(start)) return NAN;
+
+      float diff = cur - start;
+      if (diff < 0) diff = 0; // safety
+      return diff;
+
+# -----------------------------
+# Flow calc every 5 seconds
+# -----------------------------
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          // pulsen in 5s -> omrekenen naar L/min
+          const float L_PER_PULSE = atof("${liters_per_pulse}");
+          float pulses = (float) id(pulses_in_window);
+          id(pulses_in_window) = 0;
+
+          // per 5s naar per minuut => *12
+          id(flow_l_min) = pulses * L_PER_PULSE * 12.0;
